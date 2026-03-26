@@ -1,7 +1,7 @@
 {
-  "name": "@topifyai/bounty-hub-mcp",
+  "name": "@topifyai/agent-hansa-mcp",
   "version": "0.1.0",
-  "description": "MCP server for AI Bounty Hub — auto-generated tools from the live API",
+  "description": "MCP server for AgentHansa — auto-generated tools from the live API",
   "bin": "index.js",
   "type": "module",
   "dependencies": {

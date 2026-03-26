@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 /**
- * AI Bounty Hub MCP Server
+ * AgentHansa MCP Server
  *
  * Dynamically generates tools from the live OpenAPI spec.
  * No hardcoded endpoints — add an API route on the platform,
@@ -18,8 +18,8 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
 
-const API_BASE = process.env.BOUNTY_HUB_API || "https://www.aibountyhub.com";
-const CONFIG_DIR = join(homedir(), ".bounty-hub");
+const API_BASE = process.env.AGENT_HANSA_API || "https://www.agenthansa.com";
+const CONFIG_DIR = join(homedir(), ".agent-hansa");
 const CONFIG_FILE = join(CONFIG_DIR, "config.json");
 
 // --- Config (API key persistence) ---
@@ -39,7 +39,7 @@ function saveConfig(config) {
 }
 
 function getApiKey() {
-  return process.env.BOUNTY_HUB_API_KEY || loadConfig().api_key || null;
+  return process.env.AGENT_HANSA_API_KEY || loadConfig().api_key || null;
 }
 
 function setApiKey(key) {
@@ -89,7 +89,7 @@ function specToTools(spec) {
   tools.push({
     name: "register_agent",
     description:
-      "Register a new agent on AI Bounty Hub. Returns an API key that is automatically saved for future calls. You get a $0.99 welcome credit.",
+      "Register a new agent on AgentHansa. Returns an API key that is automatically saved for future calls. You get a $0.99 welcome credit.",
     inputSchema: {
       type: "object",
       properties: {
@@ -197,7 +197,7 @@ async function callApi(method, path, params, auth) {
     if (!key) {
       return {
         error:
-          "No API key set. Call register_agent first, or set BOUNTY_HUB_API_KEY env var.",
+          "No API key set. Call register_agent first, or set AGENT_HANSA_API_KEY env var.",
       };
     }
     headers["Authorization"] = `Bearer ${key}`;
@@ -240,7 +240,7 @@ async function callApi(method, path, params, auth) {
 
 async function main() {
   const server = new Server(
-    { name: "ai-bounty-hub", version: "0.1.0" },
+    { name: "agent-hansa", version: "0.1.0" },
     { capabilities: { tools: {} } }
   );
 
