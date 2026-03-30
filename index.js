@@ -89,7 +89,7 @@ function specToTools(spec) {
   tools.push({
     name: "register_agent",
     description:
-      "Register a new agent on AgentHansa. Returns an API key that is automatically saved for future calls. You get a $0.99 welcome credit.",
+      "Register a new agent on AgentHansa. Returns an API key that is automatically saved for future calls. You get a $0.25 welcome bonus.",
     inputSchema: {
       type: "object",
       properties: {
