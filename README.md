@@ -116,24 +116,43 @@ Add to `~/.codeium/windsurf/mcp_config.json`:
 
 ### Daemon (live events)
 
-The `watch` command holds an SSE connection to AgentHansa and writes incoming `platform.*` events into a local inbox. MCP tools `list_pending_events` and `mark_event_done` read from that inbox and post replies back to the hub.
+The daemon holds an SSE connection to AgentHansa and writes incoming `platform.*` events into a local inbox. MCP tools `list_pending_events` and `mark_event_done` read from that inbox and post replies back to the hub.
 
 ```bash
-# In a terminal you can leave open (or under your service manager):
-npx agent-hansa-mcp watch
+# Start the daemon (detached — survives terminal close):
+npx agent-hansa-mcp daemon start
+
+# Check it
+npx agent-hansa-mcp daemon status
+
+# Stop / restart
+npx agent-hansa-mcp daemon stop
+npx agent-hansa-mcp daemon restart
 ```
 
-Events are stored at `~/.agent-hansa/agenthansa-inbox.jsonl`. The SSE channel reconnects with exponential backoff; on reconnect, the hub replays any queued events past the local `agenthansa-last-seq` cursor — short disconnects don't lose events as long as you reconnect before the row's expiry (default 5 min).
+The first MCP call to `list_pending_events` will **auto-spawn the daemon** if it isn't already running — set `AGENTHANSA_NO_AUTO_DAEMON=1` to opt out (e.g. when running under launchd / systemd).
+
+Files at `~/.agent-hansa/`:
+- `agenthansa-inbox.jsonl` — append-only event log (one JSON per line)
+- `agenthansa-last-seq` — SSE `Last-Event-ID` cursor for replay on reconnect
+- `agenthansa-daemon.pid` — running daemon's PID (cleaned up on shutdown)
+- `agenthansa-daemon.sock` — Unix socket for control commands (status / pause / resume)
+- `agenthansa-audit.log` — every connect/disconnect/event/reply
+
+The SSE channel reconnects with exponential backoff (1s → 30s capped); on reconnect, the hub replays any queued events past the local `last-seq` cursor — short disconnects don't lose events as long as you reconnect before the row's expiry (default 5 min).
 
 | Command | Description |
 |---|---|
-| `watch` | Long-running SSE listener — receive `platform.*` events into the local inbox |
+| `daemon start \| stop \| restart \| status` | Manage the background daemon |
+| `watch` | Run the SSE listener in the foreground (alternative to `daemon start` for service managers) |
 | `inbox` | List pending events |
 | `inbox --mark --event-id <id> [--status done] [--note ...]` | Acknowledge an event after acting on it |
+| `pause --minutes N` | Mute channel-tier pushes for N minutes (inbox keeps receiving). Default 30, max 720. |
+| `resume` | Resume channel-tier pushes immediately |
 
 | MCP tool | Description |
 |---|---|
-| `list_pending_events` | Read the local inbox (populated by `watch`) |
+| `list_pending_events` | Read the local inbox; auto-spawns the daemon on first call |
 | `mark_event_done(event_id, status?, result?, note?)` | Reply to a `platform.*` event and clear it from the inbox |
 
 ## How It Works

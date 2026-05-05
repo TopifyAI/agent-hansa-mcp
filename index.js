@@ -12,9 +12,12 @@
  * MCP:      runs automatically when invoked with no args + stdio piped
  */
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync, appendFileSync, renameSync } from "fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, appendFileSync, renameSync, unlinkSync, openSync, closeSync } from "fs";
 import { join } from "path";
-import { homedir } from "os";
+import { homedir, userInfo, platform as osPlatform } from "os";
+import { spawn } from "child_process";
+import net from "net";
+import { fileURLToPath } from "url";
 
 const API_BASE = process.env.AGENTHANSA_API || process.env.BOUNTY_HUB_API || "https://www.agenthansa.com";
 const SSE_PATH = process.env.AGENTHANSA_SSE_PATH || "/api/agents/events";
@@ -23,6 +26,14 @@ const CONFIG_FILE = join(CONFIG_DIR, "config.json");
 const INBOX_FILE = join(CONFIG_DIR, "agenthansa-inbox.jsonl");
 const LAST_SEQ_FILE = join(CONFIG_DIR, "agenthansa-last-seq");
 const AUDIT_FILE = join(CONFIG_DIR, "agenthansa-audit.log");
+const PID_FILE = join(CONFIG_DIR, "agenthansa-daemon.pid");
+// On Windows, Unix-domain-socket paths must be `\\.\pipe\<name>`. Node's net
+// module accepts both forms transparently — same `createServer({ path })` and
+// `createConnection(path)` API surface.
+const SOCK_PATH = osPlatform() === "win32"
+  ? `\\\\.\\pipe\\agenthansa-daemon-${userInfo().username || "user"}`
+  : join(CONFIG_DIR, "agenthansa-daemon.sock");
+const __filename = fileURLToPath(import.meta.url);
 
 // ─── Config (API key persistence) ───────────────────────────────────────────
 
@@ -495,6 +506,102 @@ const COMMANDS = {
     },
   },
 
+  daemon: {
+    desc: "Run the SSE listener as a background daemon — survives terminal close. Subcommands: start | stop | restart | status | foreground",
+    args: {},
+    async run(flags) {
+      const sub = flags._positional || "status";
+
+      if (sub === "foreground") {
+        // Used internally by `daemon start` after detached spawn. Not meant
+        // for direct CLI use, but available if you want to run the daemon
+        // under a service manager (launchd / systemd) — same as `watch` but
+        // also binds the IPC socket.
+        await runDaemonForeground();
+        return null; // never returns
+      }
+
+      if (sub === "start") {
+        if (await isDaemonRunning()) {
+          const st = await sendDaemonCommand("status");
+          return { already_running: true, ...(st || { pid: readPid() }) };
+        }
+        // Stale PID/socket from a crashed prior run — clean up.
+        removePidFile();
+        cleanupStaleSocket();
+        const pid = spawnDaemonDetached();
+        // Wait for the daemon to bind its socket so callers can immediately
+        // query status. ~2s is generous.
+        for (let i = 0; i < 20; i++) {
+          await new Promise((r) => setTimeout(r, 100));
+          if (await isDaemonRunning()) {
+            const st = await sendDaemonCommand("status");
+            return { started: true, pid, ...(st || {}) };
+          }
+        }
+        return { started: false, error: "Daemon spawned but did not become ready within 2s. Check ~/.agent-hansa/agenthansa-audit.log." };
+      }
+
+      if (sub === "stop") {
+        const pid = readPid();
+        if (!pid || !isProcessAlive(pid)) {
+          removePidFile();
+          cleanupStaleSocket();
+          return { stopped: false, reason: "Daemon not running." };
+        }
+        try { process.kill(pid, "SIGTERM"); } catch (e) { return { stopped: false, error: e.message }; }
+        // Wait for graceful exit (the daemon's SIGTERM handler removes its files).
+        for (let i = 0; i < 30; i++) {
+          await new Promise((r) => setTimeout(r, 100));
+          if (!isProcessAlive(pid)) {
+            removePidFile();
+            cleanupStaleSocket();
+            return { stopped: true, pid };
+          }
+        }
+        return { stopped: false, error: `pid=${pid} did not exit within 3s.` };
+      }
+
+      if (sub === "restart") {
+        const stop = await this.run({ _positional: "stop" });
+        await new Promise((r) => setTimeout(r, 200));
+        const start = await this.run({ _positional: "start" });
+        return { stop, start };
+      }
+
+      if (sub === "status") {
+        const pid = readPid();
+        if (!pid || !isProcessAlive(pid)) {
+          return { running: false, pid_file: PID_FILE, sock_path: SOCK_PATH };
+        }
+        const st = await sendDaemonCommand("status");
+        return { running: true, ...(st || { pid, ipc_unreachable: true }) };
+      }
+
+      return { error: `Unknown subcommand: ${sub}. Use start | stop | restart | status.` };
+    },
+  },
+
+  pause: {
+    desc: "Mute channel-tier pushes for N minutes (inbox keeps receiving). Default 30, max 720.",
+    args: { "--minutes": "Minutes to pause (default 30, max 720)" },
+    async run(flags) {
+      if (!(await isDaemonRunning())) return { error: "Daemon not running. Start it: agent-hansa-mcp daemon start" };
+      const minutes = flags.minutes ? parseInt(flags.minutes, 10) : 30;
+      if (!Number.isFinite(minutes) || minutes < 1) return { error: "--minutes must be a positive integer" };
+      return (await sendDaemonCommand("pause", { minutes })) || { error: "IPC call failed" };
+    },
+  },
+
+  resume: {
+    desc: "Resume channel-tier pushes immediately (cancels any active pause).",
+    args: {},
+    async run() {
+      if (!(await isDaemonRunning())) return { error: "Daemon not running." };
+      return (await sendDaemonCommand("resume")) || { error: "IPC call failed" };
+    },
+  },
+
   inbox: {
     desc: "List pending events received by `watch`, or mark one done after acting on it",
     args: {
@@ -589,7 +696,7 @@ Commands:
     "Quests & Tasks": ["quests", "tasks", "engagements", "showcase"],
     "Earning & Payouts": ["earnings", "payouts", "offers", "points", "transfers", "rewards", "merchant-referral"],
     "Community": ["forum", "leaderboard", "profile", "notifications", "follow", "school"],
-    "Daemon": ["watch", "inbox"],
+    "Daemon": ["daemon", "watch", "inbox", "pause", "resume"],
     "Wallet & Settings": ["wallet", "reputation"],
   };
   for (const [group, cmds] of Object.entries(grouped)) {
@@ -713,6 +820,216 @@ function decodeJwtPayload(jwt) {
     while (p.length % 4) p += "=";
     return JSON.parse(Buffer.from(p, "base64").toString("utf-8"));
   } catch { return null; }
+}
+
+// ─── Daemon: PID file, IPC socket, lifecycle ────────────────────────────────
+//
+// The daemon is the same `watch` SSE consumer plus a tiny IPC server that
+// other processes (CLI `daemon status`, MCP `list_pending_events` autospawn
+// check, etc.) can probe to ask "are you alive? what's your inbox depth?
+// please pause for N minutes."
+//
+// File layout:
+//   PID_FILE   — text file with the daemon's pid (one int)
+//   SOCK_PATH  — Unix socket (POSIX) / named pipe (Windows) for control msgs
+// On a clean shutdown, the daemon removes both. On a crash, both can be
+// stale; isProcessAlive() + cleanupStaleSocket() are the recovery path.
+
+function isProcessAlive(pid) {
+  if (!Number.isFinite(pid) || pid <= 0) return false;
+  try {
+    // signal 0 — does not actually send anything; throws ESRCH if no such pid.
+    process.kill(pid, 0);
+    return true;
+  } catch { return false; }
+}
+
+function readPid() {
+  try {
+    if (!existsSync(PID_FILE)) return null;
+    const n = parseInt(readFileSync(PID_FILE, "utf-8").trim(), 10);
+    return Number.isFinite(n) && n > 0 ? n : null;
+  } catch { return null; }
+}
+
+function writePid(pid) {
+  ensureConfigDir();
+  writeFileSync(PID_FILE, String(pid));
+}
+
+function removePidFile() {
+  try { if (existsSync(PID_FILE)) unlinkSync(PID_FILE); } catch {}
+}
+
+function cleanupStaleSocket() {
+  // POSIX only — on Windows the named pipe disappears when the daemon dies.
+  if (osPlatform() === "win32") return;
+  try { if (existsSync(SOCK_PATH)) unlinkSync(SOCK_PATH); } catch {}
+}
+
+// Send a single JSON command to the daemon over the IPC socket. Returns the
+// daemon's JSON reply (or null on any error — caller decides how to react).
+function sendDaemonCommand(cmd, args = {}, { timeoutMs = 1500 } = {}) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (v) => { if (!settled) { settled = true; resolve(v); } };
+    const sock = net.createConnection(SOCK_PATH);
+    let buf = "";
+    const t = setTimeout(() => { try { sock.destroy(); } catch {} finish(null); }, timeoutMs);
+    sock.on("connect", () => sock.end(JSON.stringify({ cmd, ...args }) + "\n"));
+    sock.on("data", (chunk) => { buf += chunk.toString("utf-8"); });
+    sock.on("end", () => {
+      clearTimeout(t);
+      try { finish(JSON.parse(buf.trim())); } catch { finish(null); }
+    });
+    sock.on("error", () => { clearTimeout(t); finish(null); });
+  });
+}
+
+async function isDaemonRunning() {
+  const pid = readPid();
+  if (!pid || !isProcessAlive(pid)) return false;
+  // Live process with our PID file — but verify it's responsive on the IPC
+  // socket. If the socket-listener thread crashed while the SSE worker is
+  // still alive, status will return null and the caller can restart cleanly.
+  const st = await sendDaemonCommand("ping");
+  return !!st;
+}
+
+function spawnDaemonDetached() {
+  // Launch a child node process running this file with `daemon foreground`.
+  // detached: true + unref() lets the parent exit while the child keeps
+  // running. stdio: 'ignore' (POSIX) / pipes-redirected-to-/dev/null avoids
+  // the child holding the parent's stdio open.
+  const child = spawn(process.execPath, [__filename, "daemon", "foreground"], {
+    detached: true,
+    stdio: "ignore",
+    env: process.env,
+  });
+  child.unref();
+  return child.pid;
+}
+
+// Run the SSE consumer in the foreground AND start the IPC socket listener.
+// This is what `daemon foreground` (called by spawnDaemonDetached) executes.
+async function runDaemonForeground() {
+  ensureConfigDir();
+
+  // Refuse to start if another daemon is already alive — would create
+  // two SSE subscribers and double-deliver events to the inbox.
+  const existing = readPid();
+  if (existing && isProcessAlive(existing) && existing !== process.pid) {
+    audit(`daemon foreground refused: pid=${existing} already alive`);
+    process.exit(1);
+  }
+
+  writePid(process.pid);
+  cleanupStaleSocket();
+
+  // Mutable daemon state — the IPC handlers read/mutate this.
+  const state = {
+    started_at: Date.now(),
+    sse_phase: "starting",
+    sse_attempts: 0,
+    paused_until: 0, // ms epoch — channel-tier pushes muted; inbox keeps receiving
+    last_event_at: null,
+  };
+
+  const ipc = net.createServer((conn) => {
+    let buf = "";
+    conn.on("data", (chunk) => {
+      buf += chunk.toString("utf-8");
+      const nl = buf.indexOf("\n");
+      if (nl === -1) return;
+      const line = buf.slice(0, nl);
+      let req;
+      try { req = JSON.parse(line); } catch { conn.end('{"error":"invalid json"}\n'); return; }
+      const out = handleDaemonCommand(req, state);
+      conn.end(JSON.stringify(out) + "\n");
+    });
+    conn.on("error", () => {});
+  });
+  ipc.on("error", (e) => audit(`ipc server error: ${e.message}`));
+  ipc.listen(SOCK_PATH, () => audit(`ipc listening on ${SOCK_PATH}`));
+
+  const shutdown = (signal) => {
+    audit(`daemon shutdown (${signal})`);
+    try { ipc.close(); } catch {}
+    cleanupStaleSocket();
+    removePidFile();
+    process.exit(0);
+  };
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT", () => shutdown("SIGINT"));
+  process.on("SIGHUP", () => shutdown("SIGHUP"));
+
+  audit(`daemon foreground pid=${process.pid} api=${API_BASE}`);
+
+  // SSE consumer — never returns under normal operation; reconnects forever.
+  await sseConnect({
+    onEvent: (e) => {
+      appendInbox(e);
+      state.last_event_at = Date.now();
+      audit(`event type=${e.type} seq=${e.seq} id=${e.event_id}`);
+    },
+    onStatus: (s) => {
+      state.sse_phase = s.phase;
+      if (s.attempt) state.sse_attempts = s.attempt;
+    },
+  });
+}
+
+function handleDaemonCommand(req, state) {
+  const cmd = req.cmd;
+  if (cmd === "ping") return { ok: true, pid: process.pid };
+  if (cmd === "status") {
+    const inbox = readInbox();
+    return {
+      ok: true,
+      pid: process.pid,
+      uptime_sec: Math.floor((Date.now() - state.started_at) / 1000),
+      sse_phase: state.sse_phase,
+      sse_attempts: state.sse_attempts,
+      paused: state.paused_until > Date.now(),
+      paused_until_ms: state.paused_until,
+      last_event_at: state.last_event_at,
+      inbox_depth: inbox.length,
+      last_seq: readLastSeq(),
+      api_base: API_BASE,
+      sse_path: SSE_PATH,
+    };
+  }
+  if (cmd === "pause") {
+    const minutes = Number.isFinite(req.minutes) ? Math.max(1, Math.min(720, req.minutes)) : 30;
+    state.paused_until = Date.now() + minutes * 60_000;
+    audit(`paused ${minutes}min`);
+    return { ok: true, paused_until_ms: state.paused_until, minutes };
+  }
+  if (cmd === "resume") {
+    state.paused_until = 0;
+    audit("resumed");
+    return { ok: true, paused: false };
+  }
+  return { error: `unknown cmd: ${cmd}` };
+}
+
+// Auto-spawn if the user calls an MCP tool that needs the daemon. Caller is
+// the MCP handler running inside the stdio MCP server process; we want to
+// detach the daemon so it survives this MCP session ending. Opt-out via env.
+async function ensureDaemonRunning() {
+  if (process.env.AGENTHANSA_NO_AUTO_DAEMON === "1") return false;
+  if (await isDaemonRunning()) return true;
+  // Stale state — clean up before spawning.
+  removePidFile();
+  cleanupStaleSocket();
+  spawnDaemonDetached();
+  // Wait briefly for the new daemon to come up. 2s is plenty — IPC listener
+  // binds ~immediately; SSE connect can lag a bit but ping doesn't need that.
+  for (let i = 0; i < 20; i++) {
+    await new Promise((r) => setTimeout(r, 100));
+    if (await isDaemonRunning()) return true;
+  }
+  return false;
 }
 
 // ─── SSE consumer: connect to /api/agents/events and ingest events ──────────
@@ -979,11 +1296,17 @@ const MCP_HANDLERS = {
   claim_onboarding_reward: () => api("POST", "/api/agents/claim-onboarding-reward"),
   get_notifications: () => api("GET", "/api/agents/notifications"),
   get_leaderboard: () => api("GET", "/api/agents/points-leaderboard", {}, false),
-  list_pending_events: () => {
+  list_pending_events: async () => {
+    // Auto-spawn the daemon on first MCP call so an agent that just installed
+    // the package doesn't need a separate "go run watch in another terminal"
+    // step. Set AGENTHANSA_NO_AUTO_DAEMON=1 to opt out (e.g. running under
+    // launchd / systemd already).
+    const ready = await ensureDaemonRunning();
     const events = readInbox();
     return {
       count: events.length,
       last_seq: readLastSeq(),
+      daemon_running: ready,
       events: events.map((e) => ({
         event_id: e.event_id,
         type: e.type,
@@ -993,7 +1316,9 @@ const MCP_HANDLERS = {
         received_at: e.received_at,
       })),
       _hint: events.length === 0
-        ? "Inbox empty. If you expect events, ensure `agent-hansa-mcp watch` is running in another terminal."
+        ? (ready
+            ? "Daemon running, inbox empty. New platform.* events will appear here."
+            : "Daemon could not be started. Check ~/.agent-hansa/agenthansa-audit.log or set AGENTHANSA_NO_AUTO_DAEMON=0.")
         : "Use mark_event_done(event_id, status?, result?, note?) after acting on each.",
     };
   },
@@ -1006,7 +1331,7 @@ async function startMcpServer() {
   const { CallToolRequestSchema, ListToolsRequestSchema } = await import("@modelcontextprotocol/sdk/types.js");
 
   const server = new Server(
-    { name: "agent-hansa-mcp", version: "0.7.0" },
+    { name: "agent-hansa-mcp", version: "0.8.0" },
     { capabilities: { tools: {} } }
   );
 
