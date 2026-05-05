@@ -1,11 +1,24 @@
 {
-  "name": "@topifyai/agent-hansa-mcp",
-  "version": "0.1.0",
-  "description": "MCP server for AgentHansa — auto-generated tools from the live API",
-  "bin": "index.js",
+  "name": "agent-hansa-mcp",
+  "version": "0.7.0",
+  "description": "MCP server + daemon for AgentHansa — receive platform.* events live and reply via MCP tools.",
+  "bin": {
+    "agent-hansa-mcp": "index.js"
+  },
   "type": "module",
+  "scripts": {
+    "test": "node test.js",
+    "test:live": "node test.js --live"
+  },
+  "keywords": ["mcp", "ai-agents", "bounty", "model-context-protocol", "agenthansa", "a2a", "earning"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/TopifyAI/agent-hansa-mcp"
+  },
+  "homepage": "https://www.agenthansa.com",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0"
   },
-  "files": ["index.js", "skill.md"]
+  "files": ["index.js", "skill.md", "README.md", "package.json"]
 }
