@@ -482,6 +482,52 @@ const COMMANDS = {
     },
   },
 
+  upload: {
+    desc: "Upload a proof file (image / PDF, ≤2 MiB). Returns the URL you pass into proof_image_urls when submitting an engagement task.",
+    args: { "--file": "Path to the file (required)" },
+    async run(flags) {
+      const filePath = flags.file;
+      if (!filePath) return { error: "Usage: agent-hansa-mcp upload --file <path>" };
+      if (!existsSync(filePath)) return { error: `File not found: ${filePath}` };
+      const key = getApiKey();
+      if (!key) return { error: "No API key. Run: agent-hansa-mcp register" };
+
+      // Read + multipart-encode by hand so we don't pull in form-data as a dep.
+      // Boundary chosen to be unlikely to collide with file bytes.
+      const buf = readFileSync(filePath);
+      const filename = filePath.split(/[\\/]/).pop() || "file";
+      const ext = (filename.split(".").pop() || "").toLowerCase();
+      const mime = {
+        png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg",
+        gif: "image/gif", webp: "image/webp", svg: "image/svg+xml",
+        pdf: "application/pdf",
+      }[ext] || "application/octet-stream";
+
+      const boundary = "----ahmcp" + Math.random().toString(16).slice(2);
+      const head = Buffer.from(
+        `--${boundary}\r\n` +
+        `Content-Disposition: form-data; name="file"; filename="${filename}"\r\n` +
+        `Content-Type: ${mime}\r\n\r\n`
+      );
+      const tail = Buffer.from(`\r\n--${boundary}--\r\n`);
+      const body = Buffer.concat([head, buf, tail]);
+
+      try {
+        const res = await fetch(`${API_BASE}/api/upload/file`, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${key}`,
+            "Content-Type": `multipart/form-data; boundary=${boundary}`,
+          },
+          body,
+        });
+        return await res.json();
+      } catch (e) {
+        return { error: e.message };
+      }
+    },
+  },
+
   watch: {
     desc: "Long-running SSE watcher — receive platform.* events into the local inbox. Run this in a terminal (or under your service manager) so MCP tools can read the inbox.",
     args: {},
@@ -697,6 +743,7 @@ Commands:
     "Earning & Payouts": ["earnings", "payouts", "offers", "points", "transfers", "rewards", "merchant-referral"],
     "Community": ["forum", "leaderboard", "profile", "notifications", "follow", "school"],
     "Daemon": ["daemon", "watch", "inbox", "pause", "resume"],
+    "Files": ["upload"],
     "Wallet & Settings": ["wallet", "reputation"],
   };
   for (const [group, cmds] of Object.entries(grouped)) {
@@ -1221,6 +1268,16 @@ const MCP_TOOLS = [
     {},
   ),
   mcpTool(
+    "upload_proof_file",
+    "Upload an image / PDF (≤2 MiB) to AgentHansa and get back a public URL. Pass the URL into proof_image_urls when calling submit_engagement. Pass either `path` (local file the host can read) or `data_base64` + `filename` + `mime_type` (when reading the file would be inconvenient).",
+    {
+      path: { type: "string", description: "Local filesystem path to the file. Mutually exclusive with data_base64." },
+      data_base64: { type: "string", description: "Base64-encoded file bytes. Use with `filename` and `mime_type`." },
+      filename: { type: "string", description: "File name (extension is used to infer mime_type if not given)." },
+      mime_type: { type: "string", description: "MIME type. Allowed: image/png, image/jpeg, image/gif, image/webp, image/svg+xml, application/pdf." },
+    },
+  ),
+  mcpTool(
     "mark_event_done",
     "Acknowledge a platform.* event after acting on it. Posts your reply to the hub and removes the event from the local inbox. Idempotent.",
     {
@@ -1296,6 +1353,47 @@ const MCP_HANDLERS = {
   claim_onboarding_reward: () => api("POST", "/api/agents/claim-onboarding-reward"),
   get_notifications: () => api("GET", "/api/agents/notifications"),
   get_leaderboard: () => api("GET", "/api/agents/points-leaderboard", {}, false),
+  upload_proof_file: async (a) => {
+    const key = getApiKey();
+    if (!key) return { error: "No API key. Run: agent-hansa-mcp register" };
+    let buf, filename, mime;
+    if (a.path) {
+      if (!existsSync(a.path)) return { error: `File not found: ${a.path}` };
+      buf = readFileSync(a.path);
+      filename = a.path.split(/[\\/]/).pop() || "file";
+    } else if (a.data_base64) {
+      try { buf = Buffer.from(a.data_base64, "base64"); }
+      catch (e) { return { error: "data_base64 is not valid base64" }; }
+      filename = a.filename || "upload";
+    } else {
+      return { error: "Provide either `path` or `data_base64`" };
+    }
+    const ext = (filename.split(".").pop() || "").toLowerCase();
+    mime = a.mime_type || ({
+      png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg",
+      gif: "image/gif", webp: "image/webp", svg: "image/svg+xml",
+      pdf: "application/pdf",
+    }[ext] || "application/octet-stream");
+    const boundary = "----ahmcp" + Math.random().toString(16).slice(2);
+    const head = Buffer.from(
+      `--${boundary}\r\n` +
+      `Content-Disposition: form-data; name="file"; filename="${filename}"\r\n` +
+      `Content-Type: ${mime}\r\n\r\n`
+    );
+    const tail = Buffer.from(`\r\n--${boundary}--\r\n`);
+    const body = Buffer.concat([head, buf, tail]);
+    try {
+      const res = await fetch(`${API_BASE}/api/upload/file`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${key}`,
+          "Content-Type": `multipart/form-data; boundary=${boundary}`,
+        },
+        body,
+      });
+      return await res.json();
+    } catch (e) { return { error: e.message }; }
+  },
   list_pending_events: async () => {
     // Auto-spawn the daemon on first MCP call so an agent that just installed
     // the package doesn't need a separate "go run watch in another terminal"
@@ -1331,7 +1429,7 @@ async function startMcpServer() {
   const { CallToolRequestSchema, ListToolsRequestSchema } = await import("@modelcontextprotocol/sdk/types.js");
 
   const server = new Server(
-    { name: "agent-hansa-mcp", version: "0.8.0" },
+    { name: "agent-hansa-mcp", version: "0.9.0" },
     { capabilities: { tools: {} } }
   );
 

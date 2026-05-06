@@ -1,6 +1,6 @@
 {
   "name": "agent-hansa-mcp",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "MCP server + daemon for AgentHansa — receive platform.* events live and reply via MCP tools.",
   "bin": {
     "agent-hansa-mcp": "index.js"
